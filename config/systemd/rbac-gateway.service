@@ -1,0 +1,19 @@
+# klipper-rbac-gateway — systemd unit
+# Adjust User and the paths if your user is not "pi" or the repository lives elsewhere.
+[Unit]
+Description=Klipper RBAC Gateway (login + roles for Mainsail/Moonraker)
+After=network.target moonraker.service
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/klipper-rbac-gateway
+ExecStart=/home/pi/klipper-rbac-gateway/venv/bin/uvicorn main:app --host 127.0.0.1 --port 7200 --workers 1
+Restart=always
+RestartSec=2
+# Optional settings (see README):
+# Environment=RBAC_LOGIN_TITLE=Ender 3
+# Environment=RBAC_SESSION_DAYS=7
+# Environment=RBAC_SECURE_COOKIE=1
+
+[Install]
+WantedBy=multi-user.target
