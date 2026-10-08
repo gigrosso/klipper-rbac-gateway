@@ -343,6 +343,6 @@ klipper-rbac-gateway/
 
 ## Licença
 
-[MIT](LICENSE).
+[GNU General Public License v3.0](LICENSE).
 
 Este projeto não tem relação oficial com o Klipper, o Moonraker ou o Mainsail.
