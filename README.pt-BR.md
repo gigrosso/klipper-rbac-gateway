@@ -52,7 +52,7 @@ flowchart LR
 2. Depois do login, o Mainsail carrega normalmente. O tráfego de API e WebSocket vai para o gateway, em vez de ir direto ao Moonraker.
 3. O **gateway** confere cada requisição HTTP e cada mensagem JSON-RPC contra o papel do usuário. O que é permitido segue para o Moonraker usando a API key do próprio Moonraker. O que é negado recebe erro `403`, que o Mainsail mostra como notificação.
 4. O **Moonraker** escuta só em `127.0.0.1` e não confia em nenhum cliente, então ninguém na rede consegue contornar o gateway.
-5. Para admins, um pequeno script (`ui.js`) é injetado pelo nginx (`sub_filter`) na página do Mainsail e acrescenta a aba **Users** nas Configurações de Interface.
+5. Um pequeno script (`ui.js`) é injetado pelo nginx (`sub_filter`) na página do Mainsail. Para admins ele acrescenta a aba **Users** nas Configurações de Interface; para todos, mostra quem criou cada arquivo/pasta na lista de G-codes.
 
 Usuários, hashes de senha (scrypt) e sessões ficam no banco SQLite do próprio gateway. Os usuários do Moonraker não são usados.
 
@@ -63,7 +63,9 @@ Usuários, hashes de senha (scrypt) e sessões ficam no banco SQLite do próprio
 | Ver temperaturas, progresso, webcam, histórico, arquivos | ✅ | ✅ | ✅ |
 | Parada de emergência | ✅ | ✅ | ✅ |
 | Iniciar / pausar / retomar / cancelar impressões | ❌ | ✅ | ✅ |
-| Enviar, mover e apagar arquivos em `gcodes/` | ❌ | ✅ | ✅ |
+| Enviar arquivos e criar pastas em `gcodes/` | ❌ | ✅ | ✅ |
+| Mover e apagar os **próprios** arquivos/pastas em `gcodes/` | ❌ | ✅ | ✅ |
+| Mover e apagar arquivos/pastas de **qualquer um** | ❌ | ❌ | ✅ |
 | Console / botões (só G-code da lista permitida) | ❌ | ✅ | ✅ |
 | Qualquer G-code, macros fora da lista, `SAVE_CONFIG`, reinícios | ❌ | ❌ | ✅ |
 | Editar `printer.cfg` e outros arquivos de configuração | ❌ | ❌ | ✅ |
@@ -222,6 +224,23 @@ venv/bin/python main.py apikey                  # busca de novo a API key do Moo
 
 A linha de comando funciona mesmo se ninguém conseguir entrar pelo navegador, e é o jeito de recuperar uma senha esquecida.
 
+### Dono dos arquivos
+
+Todo arquivo ou pasta criado pelo gateway (upload, nova pasta, cópia) fica registrado com o usuário que o criou. A lista de G-codes do Mainsail mostra esse nome ao lado de cada item (destacado quando é seu).
+
+- **Operadores** só apagam ou movem o que eles mesmos criaram. No caso de uma pasta, tudo dentro dela também precisa ser deles. Também não podem sobrescrever (enviar, mover ou copiar por cima) um item criado por outra pessoa.
+- **Admins** apagam ou movem qualquer coisa.
+- Itens sem dono registrado (anteriores a este recurso, ou criados fora do gateway por SSH, Samba, upload do fatiador direto no Moonraker...) aparecem como **no record** e só o admin pode apagá-los.
+
+Para atribuir um arquivo ou pasta já existente a um usuário pela linha de comando:
+
+```bash
+venv/bin/python main.py owner gcodes/Testes joao        # uma pasta (só a pasta em si)
+venv/bin/python main.py owner gcodes/peca.gcode joao    # um arquivo
+```
+
+Os donos ficam na tabela `owners` do `rbac.db`. Remover um usuário mantém os registros, então os arquivos dele passam a ser só do admin.
+
 ## Configuração
 
 As configurações vêm de variáveis de ambiente. Defina-as com linhas `Environment=` no arquivo do serviço e depois rode `sudo systemctl daemon-reload && sudo systemctl restart rbac-gateway`.
@@ -230,6 +249,7 @@ As configurações vêm de variáveis de ambiente. Defina-as com linhas `Environ
 |---|---|---|
 | `RBAC_MOONRAKER_URL` | `http://127.0.0.1:7125` | Onde o Moonraker escuta |
 | `RBAC_DATA_DIR` | `~/printer_data/gateway` | Pasta do banco (`rbac.db`) e da API key |
+| `RBAC_PRINTER_DATA` | `~/printer_data` | Pasta com as raízes do Moonraker (`gcodes/`, ...), usada para conferir o conteúdo das pastas no controle de dono |
 | `RBAC_SESSION_DAYS` | `7` | Duração da sessão |
 | `RBAC_SECURE_COOKIE` | `0` | Use `1` quando servir por HTTPS |
 | `RBAC_LOGIN_TITLE` | `3D Printer` | Título da página de login |
@@ -311,7 +331,7 @@ Os dados de usuários ficam em `~/printer_data/gateway/`. Apague essa pasta para
 ```
 klipper-rbac-gateway/
 ├── main.py                      # gateway: login, sessões, permissões, proxy, API de usuários, CLI
-├── ui.js                        # aba "Users" injetada no Mainsail (só admins)
+├── ui.js                        # aba "Users" (admins) e nome do dono dos arquivos, injetados no Mainsail
 ├── requirements.txt
 ├── config/
 │   ├── nginx/rbac-auth.conf     # trecho do nginx (auth_request + injeção do script)

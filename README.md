@@ -50,7 +50,7 @@ flowchart LR
 2. After login, Mainsail loads normally. Its API and WebSocket traffic goes to the gateway instead of straight to Moonraker.
 3. The **gateway** checks each HTTP request and each JSON-RPC message against the user's role. Allowed requests are forwarded to Moonraker using Moonraker's API key. Denied ones get a `403` error, which Mainsail shows as a notification.
 4. **Moonraker** listens only on `127.0.0.1` and trusts no client, so the gateway cannot be bypassed from the network.
-5. For admins, a small script (`ui.js`) is injected into Mainsail's page by nginx (`sub_filter`). It adds the **Users** tab to the Interface Settings dialog.
+5. A small script (`ui.js`) is injected into Mainsail's page by nginx (`sub_filter`). For admins it adds the **Users** tab to the Interface Settings dialog; for everyone it shows who created each file/folder in the G-code list.
 
 Users, password hashes (scrypt) and sessions are stored in the gateway's own SQLite database. Moonraker users are not used.
 
@@ -61,7 +61,9 @@ Users, password hashes (scrypt) and sessions are stored in the gateway's own SQL
 | See temperatures, progress, webcam, history, files | ✅ | ✅ | ✅ |
 | Emergency stop | ✅ | ✅ | ✅ |
 | Start / pause / resume / cancel prints | ❌ | ✅ | ✅ |
-| Upload, move and delete files in `gcodes/` | ❌ | ✅ | ✅ |
+| Upload files and create folders in `gcodes/` | ❌ | ✅ | ✅ |
+| Move and delete **their own** files/folders in `gcodes/` | ❌ | ✅ | ✅ |
+| Move and delete **anyone's** files/folders | ❌ | ❌ | ✅ |
 | Console / buttons (allow-listed G-code only) | ❌ | ✅ | ✅ |
 | Any G-code, macros not on the list, `SAVE_CONFIG`, restarts | ❌ | ❌ | ✅ |
 | Edit `printer.cfg` and other config files | ❌ | ❌ | ✅ |
@@ -220,6 +222,23 @@ venv/bin/python main.py apikey                  # re-fetch Moonraker's API key
 
 The CLI works even if nobody can sign in, which makes it the way to recover a forgotten password.
 
+### File ownership
+
+Every file or folder created through the gateway (upload, new folder, copy) is recorded with the user who created it. The G-code list in Mainsail shows that name next to each item (highlighted when it is yours).
+
+- **Operators** can only delete or move what they created themselves. For a folder, everything inside it must be theirs too. They also cannot overwrite (upload, move or copy over) an item created by someone else.
+- **Admins** can delete or move anything.
+- Items with no recorded owner (created before this feature, or outside the gateway via SSH, Samba, a slicer upload straight to Moonraker...) are marked **no record** and only an admin can delete them.
+
+To assign an existing file or folder to a user from the command line:
+
+```bash
+venv/bin/python main.py owner gcodes/Tests john        # a folder (only the folder itself)
+venv/bin/python main.py owner gcodes/part.gcode john   # a file
+```
+
+Owners are stored in the `owners` table of `rbac.db`. Removing a user keeps their records, so their files then become admin-only.
+
 ## Configuration
 
 Settings are read from environment variables. Set them with `Environment=` lines in the systemd unit, then run `sudo systemctl daemon-reload && sudo systemctl restart rbac-gateway`.
@@ -228,6 +247,7 @@ Settings are read from environment variables. Set them with `Environment=` lines
 |---|---|---|
 | `RBAC_MOONRAKER_URL` | `http://127.0.0.1:7125` | Where Moonraker listens |
 | `RBAC_DATA_DIR` | `~/printer_data/gateway` | Database (`rbac.db`) and API key location |
+| `RBAC_PRINTER_DATA` | `~/printer_data` | Folder holding Moonraker's roots (`gcodes/`, ...), used to check folder contents for file ownership |
 | `RBAC_SESSION_DAYS` | `7` | Session lifetime |
 | `RBAC_SECURE_COOKIE` | `0` | Set to `1` when serving over HTTPS |
 | `RBAC_LOGIN_TITLE` | `3D Printer` | Title on the login page |
@@ -309,7 +329,7 @@ User data stays in `~/printer_data/gateway/`. Delete that folder to remove it.
 ```
 klipper-rbac-gateway/
 ├── main.py                      # gateway: login, sessions, permissions, proxy, user API, CLI
-├── ui.js                        # "Users" tab injected into Mainsail (admins only)
+├── ui.js                        # "Users" tab (admins) and file owner badges, injected into Mainsail
 ├── requirements.txt
 ├── config/
 │   ├── nginx/rbac-auth.conf     # nginx snippet (auth_request + script injection)

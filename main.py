@@ -12,6 +12,14 @@ in front of Mainsail and Moonraker.
   and it can never be deleted (neither from the UI nor from the command line).
 - The "Users" tab inside Mainsail's Interface Settings comes from ui.js.
 
+File ownership: every file/folder created through the gateway (upload, new folder,
+copy) is recorded with the user who created it (table "owners"), and ui.js shows
+that name in the G-code file list. Admins can delete/move anything; operators can
+only delete/move what they created themselves (a folder: it and everything inside
+it) and cannot overwrite another user's item. Files with no recorded owner (created
+before this feature or outside the gateway) can only be deleted by an admin; ui.js
+marks them as "no record".
+
 Command line:
   python main.py apikey                  fetch and store Moonraker's API key
   python main.py create <user> <role>    create a user (prompts for the password)
@@ -19,6 +27,8 @@ Command line:
   python main.py role <user> <role>      change a user's role
   python main.py remove <user>
   python main.py list
+  python main.py owner <root/path> <user>   set who created a file/folder
+                                           (e.g. owner gcodes/Tests john)
 Roles: viewer, operator, admin
 """
 import asyncio
@@ -50,6 +60,7 @@ from starlette.datastructures import UploadFile
 # All settings can be overridden with environment variables (see README).
 MOONRAKER_URL = os.environ.get("RBAC_MOONRAKER_URL", "http://127.0.0.1:7125").rstrip("/")
 MOONRAKER_WS = MOONRAKER_URL.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/websocket"
+PRINTER_DATA = Path(os.environ.get("RBAC_PRINTER_DATA", Path.home() / "printer_data")).expanduser()  # Moonraker roots
 DATA_DIR = Path(os.environ.get("RBAC_DATA_DIR", Path.home() / "printer_data" / "gateway")).expanduser()
 DB_PATH = DATA_DIR / "rbac.db"
 APIKEY_PATH = DATA_DIR / "api_key"
@@ -147,6 +158,8 @@ def db():
     con = sqlite3.connect(DB_PATH)
     con.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, role TEXT NOT NULL)")
     con.execute("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, username TEXT NOT NULL, expires REAL NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS owners (root TEXT NOT NULL, path TEXT NOT NULL, username TEXT NOT NULL, "
+                "created REAL NOT NULL, PRIMARY KEY (root, path))")
     return con
 
 
@@ -164,6 +177,11 @@ def init_db():
             con.execute("DROP TABLE IF EXISTS sessoes")
             con.commit()
             log.info("Migrated %d user(s) from the legacy database", len(rows))
+        if "donos" in tables:
+            n = con.execute("INSERT OR IGNORE INTO owners SELECT raiz, caminho, usuario, criado FROM donos").rowcount
+            con.execute("DROP TABLE donos")
+            con.commit()
+            log.info("Migrated %d file owner(s) from the legacy database", n)
     finally:
         con.close()
 
@@ -280,6 +298,116 @@ def rpc_denial_reason(role, method, params):
         if cmd:
             return f"G-code '{cmd}' is not allowed for role '{role}'"
     return None
+
+
+# =========================================================== FILE OWNERSHIP
+def split_path(path):
+    """'gcodes/a/b.gcode' -> ('gcodes', 'a/b.gcode'); invalid path -> (None, None)."""
+    p = posixpath.normpath(str(path).strip("/"))
+    if p in (".", "") or p.startswith(".."):
+        return None, None
+    root, _, rel = p.partition("/")
+    return root, rel
+
+
+def owners_under(con, root, rel):
+    """Recorded owners of the item and of everything inside it: {path: username}."""
+    return dict(con.execute(
+        "SELECT path, username FROM owners WHERE root=? AND (path=? OR substr(path, 1, ?)=?)",
+        (root, rel, len(rel) + 1, rel + "/")))
+
+
+def owned_by(username, root, rel):
+    """True if the item was created by `username` and, for a folder, everything inside it too.
+    Hidden items (such as .thumbs, which Moonraker itself creates) are ignored."""
+    if not root or not rel:
+        return False
+    con = db()
+    try:
+        owners = owners_under(con, root, rel)
+    finally:
+        con.close()
+    if owners.get(rel) != username:
+        return False
+    disk = PRINTER_DATA / root / rel
+    if disk.is_dir() and not disk.is_symlink():
+        for current, dirs, files in os.walk(disk):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for name in dirs + [f for f in files if not f.startswith(".")]:
+                if owners.get(posixpath.join(rel, (Path(current) / name).relative_to(disk).as_posix())) != username:
+                    return False
+    return True
+
+
+def exists(root, rel):
+    return os.path.lexists(PRINTER_DATA / root / rel)
+
+
+def real_destination(source, dest):
+    """Where move/copy actually end up: inside `dest` if it is already a folder."""
+    root, rel = split_path(dest)
+    if root and (PRINTER_DATA / root / rel).is_dir():
+        rel = posixpath.join(rel, posixpath.basename(split_path(source)[1] or ""))
+    return root, rel
+
+
+MSG_OWN_ONLY = "you can only delete or move files and folders you created"
+
+
+def ownership_denial_reason(username, role, method, params):
+    """Admins may touch anything. Others only delete/move what they created and never overwrite someone else's item."""
+    if role == "admin" or method not in FILE_WRITE_METHODS:
+        return None
+    if method in ("server.files.delete_file", "server.files.delete_directory", "server.files.move"):
+        root, rel = split_path(params.get("source" if method == "server.files.move" else "path", ""))
+        if not owned_by(username, root, rel):
+            return MSG_OWN_ONLY
+    if method in ("server.files.move", "server.files.copy"):
+        root, rel = real_destination(params.get("source", ""), params.get("dest", ""))
+        if root and exists(root, rel) and not owned_by(username, root, rel):
+            return f"'{rel}' already exists in the destination and was created by another user"
+    return None
+
+
+def record_file_operation(username, result):
+    """Update the owners table from Moonraker's success response
+    ({"action": ..., "item": {"root", "path"}, "source_item": {...}})."""
+    if isinstance(result, dict) and isinstance(result.get("result"), dict):
+        result = result["result"]
+    if not isinstance(result, dict) or not isinstance(result.get("item"), dict):
+        return
+    action = result.get("action")
+    root, rel = result["item"].get("root"), str(result["item"].get("path", "")).strip("/")
+    if not root or not rel:
+        return
+    now = time.time()
+    con = db()
+    try:
+        if action in ("create_file", "modify_file", "create_dir"):  # upload, new folder, copy
+            new = [rel]
+            disk = PRINTER_DATA / root / rel
+            if action == "create_dir" and disk.is_dir():  # copied folder: its contents belong to the copier too
+                new += [posixpath.join(rel, p.relative_to(disk).as_posix()) for p in disk.rglob("*")]
+            con.executemany("INSERT OR REPLACE INTO owners VALUES (?, ?, ?, ?)",
+                            [(root, p, username, now) for p in new])
+        elif action in ("move_file", "move_dir") and isinstance(result.get("source_item"), dict):
+            root0 = result["source_item"].get("root")
+            rel0 = str(result["source_item"].get("path", "")).strip("/")
+            if root0 and rel0:
+                con.execute("DELETE FROM owners WHERE root=? AND (path=? OR substr(path, 1, ?)=?)",
+                            (root, rel, len(rel) + 1, rel + "/"))
+                con.execute("UPDATE owners SET root=?, path=? || substr(path, ?) "
+                            "WHERE root=? AND (path=? OR substr(path, 1, ?)=?)",
+                            (root, rel, len(rel0) + 1, root0, rel0, len(rel0) + 1, rel0 + "/"))
+        elif action in ("delete_file", "delete_dir"):
+            con.execute("DELETE FROM owners WHERE root=? AND (path=? OR substr(path, 1, ?)=?)",
+                        (root, rel, len(rel) + 1, rel + "/"))
+        else:
+            return
+        con.commit()
+    finally:
+        con.close()
+    log.info("FILE %s %s/%s by %s", action, root, rel, username)
 
 
 # =========================================================== APP
@@ -464,6 +592,25 @@ async def api_me(request: Request):
     return {"username": username, "role": role_of(username)}
 
 
+@app.get("/_rbac/api/owners")
+async def api_owners(request: Request, folder: str = "gcodes"):
+    """Who created each item of a folder: {"owners": {name: username}} (only items with a recorded owner)."""
+    if session_user(request.cookies.get(COOKIE)) is None:
+        return api_error(401, "Not signed in.")
+    root, rel = split_path(folder)
+    if not root:
+        return api_error(400, "Invalid folder.")
+    prefix = rel + "/" if rel else ""
+    con = db()
+    try:
+        rows = con.execute("SELECT path, username FROM owners WHERE root=? AND substr(path, 1, ?)=?",
+                           (root, len(prefix), prefix)).fetchall()
+    finally:
+        con.close()
+    owners = {p[len(prefix):]: u for p, u in rows if p != rel and "/" not in p[len(prefix):]}
+    return {"owners": owners}
+
+
 @app.get("/_rbac/api/users")
 async def api_list_users(request: Request):
     me, error = require_admin(request)
@@ -561,6 +708,7 @@ async def proxy_ws(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    pending: set[str] = set()  # ids of file operations whose response records the owner
     query = "&".join(f"{k}={v}" for k, v in clean_params(ws.query_params))
     url = MOONRAKER_WS + (f"?{query}" if query else "")
     try:
@@ -589,18 +737,32 @@ async def proxy_ws(ws: WebSocket):
                         params.pop("api_key", None)
                         msg["params"] = params
                         raw = json.dumps(msg)
-                    reason = rpc_denial_reason(role, method, params)
+                    reason = rpc_denial_reason(role, method, params) or \
+                        ownership_denial_reason(username, role, method, params)
                     if reason:
                         log.warning("DENIED user=%s ws %s: %s", username, method, reason)
                         if "id" in msg:
                             await ws.send_text(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
                                                            "error": {"code": 403, "message": reason}}))
                         continue
+                    if method in FILE_WRITE_METHODS and "id" in msg:
+                        pending.add(json.dumps(msg["id"]))
                     await upstream.send(raw)
 
             async def moonraker_to_client():
                 async for m in upstream:
-                    await ws.send_text(m if isinstance(m, str) else m.decode())
+                    text = m if isinstance(m, str) else m.decode()
+                    # response to a file operation we are tracking: record the owner
+                    if pending and '"id"' in text:
+                        try:
+                            resp = json.loads(text)
+                        except json.JSONDecodeError:
+                            resp = None
+                        if isinstance(resp, dict) and "id" in resp and json.dumps(resp["id"]) in pending:
+                            pending.discard(json.dumps(resp["id"]))
+                            if "result" in resp:
+                                record_file_operation(username, resp["result"])
+                    await ws.send_text(text)
 
             tasks = [asyncio.create_task(client_to_moonraker()), asyncio.create_task(moonraker_to_client())]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -627,6 +789,9 @@ async def restricted_upload(request, username, role):
     data, files = {}, []
     for k, v in form.multi_items():
         if isinstance(v, UploadFile):
+            up_root, up_rel = split_path(posixpath.join(root, str(form.get("path", "")).strip("/"), v.filename or ""))
+            if not up_root or (exists(up_root, up_rel) and not owned_by(username, up_root, up_rel)):
+                return deny(403, f"'{up_rel}' already exists and was created by another user", username, route)
             content = await v.read()
             if (v.filename or "").lower().endswith((".gcode", ".g", ".gco")):
                 text = content.decode("utf-8", errors="ignore")
@@ -639,7 +804,22 @@ async def restricted_upload(request, username, role):
             data[k] = v
     r = await client.post("/server/files/upload", data=data, files=files,
                           headers=upstream_headers(request, ("content-type", "content-length")))
+    return recorded_response(r, username)
+
+
+def recorded_response(r, username):
+    """Pass a file operation's response through and, if it succeeded, record the owner."""
+    if r.is_success:
+        try:
+            record_file_operation(username, r.json())
+        except ValueError:
+            pass
     return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
+
+
+# Moonraker HTTP routes that create, move or delete files.
+FILE_OPERATIONS_HTTP = ["POST /server/files/upload", "POST /server/files/directory", "DELETE /server/files/directory",
+                        "POST /server/files/move", "POST /server/files/copy", "DELETE /server/files/*"]
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -660,10 +840,19 @@ async def proxy_http(path: str, request: Request):
 
     if route == "POST /server/files/upload" and role != "admin":
         return await restricted_upload(request, username, role)
+    if request.method == "DELETE" and route.startswith("DELETE /server/files/") and role != "admin":
+        if route == "DELETE /server/files/directory":
+            root, rel = split_path(request.query_params.get("path", ""))
+        else:
+            root, rel = split_path(path[len("server/files/"):])
+        if not owned_by(username, root, rel):
+            return deny(403, MSG_OWN_ONLY, username, route)
 
     body = request.stream() if request.method in ("POST", "PUT", "PATCH") else None
     req = client.build_request(request.method, "/" + path, params=clean_params(request.query_params),
                                headers=upstream_headers(request), content=body)
+    if matches(route, FILE_OPERATIONS_HTTP):  # small response: read it whole to record the owner
+        return recorded_response(await client.send(req), username)
     r = await client.send(req, stream=True)
     return StreamingResponse(r.aiter_raw(), status_code=r.status_code,
                              headers={k: v for k, v in r.headers.items() if k.lower() not in HOP},
@@ -743,6 +932,16 @@ if __name__ == "__main__":
             con.execute("DELETE FROM sessions WHERE username=?", (args[1],))
             con.commit()
             print(f"{args[1]} removed")
+        elif cmd == "owner" and len(args) == 3:
+            root, rel = split_path(args[1])
+            if not root or not rel or not exists(root, rel):
+                print("File/folder not found (use the root/path format, e.g. gcodes/part.gcode).")
+            elif not con.execute("SELECT 1 FROM users WHERE username=?", (args[2],)).fetchone():
+                print("User does not exist.")
+            else:
+                con.execute("INSERT OR REPLACE INTO owners VALUES (?, ?, ?, ?)", (root, rel, args[2], time.time()))
+                con.commit()
+                print(f"{root}/{rel} -> {args[2]}")
         elif cmd == "list":
             primary = primary_admin(con)
             for u, r in con.execute("SELECT username, role FROM users ORDER BY rowid"):

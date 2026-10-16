@@ -1,4 +1,5 @@
-/* klipper-rbac-gateway — "Users" tab inside Mainsail's Interface Settings (admins only). */
+/* klipper-rbac-gateway — "Users" tab inside Mainsail's Interface Settings (admins only)
+   and the name of who created each file/folder in the G-code file list (everyone). */
 (() => {
   'use strict';
   if (window.__rbacUi) return;
@@ -57,6 +58,10 @@
   .rbac-hide-active .v-tab--active:not(.rbac-tab)::before{opacity:0!important}
   .rbac-hide-active .v-tabs-slider-wrapper{display:none!important}
   .rbac-tab.rbac-tab--active{color:var(--rbac-primary,#2196f3)!important;box-shadow:inset 2px 0 0 var(--rbac-primary,#2196f3)}
+  .rbac-owner{display:inline-flex;align-items:center;gap:3px;margin-left:8px;padding:0 7px;border-radius:10px;
+    font-size:.72rem;line-height:18px;vertical-align:middle;white-space:nowrap;color:rgba(255,255,255,.6);background:rgba(255,255,255,.08)}
+  .rbac-owner--you{color:var(--rbac-primary,#2196f3);background:rgba(33,150,243,.12)}
+  .rbac-owner--none{font-style:italic;color:rgba(255,255,255,.4);background:transparent;border:1px dashed rgba(255,255,255,.2)}
   `;
 
   const state = { users: [], roles: ['viewer', 'operator', 'admin'], selected: new Set() };
@@ -326,21 +331,99 @@
     });
   }
 
+  // ------------------------------------------------------------------ file owners
+  // Rows of Mainsail's G-code file list are Vue 2 components: tr.__vue__ holds the item and the current folder.
+  const ICON_PERSON = 'M12,4A4,4 0 0,1 16,8A4,4 0 0,1 12,12A4,4 0 0,1 8,8A4,4 0 0,1 12,4M12,14C16.42,14 20,15.79 20,18V20H4V18C4,15.79 7.58,14 12,14Z';
+  const owners = { folder: null, map: {}, seen: new Set(), fetchedAt: 0, startedAt: 0, ok: false, fetching: false };
+  const firstSeen = new Map();  // 'folder/name' -> when it first appeared in the list
+  let myName = '';
+
+  async function fetchOwners(folder, names) {
+    if (owners.fetching) return;
+    owners.fetching = true;
+    const seen = new Set(names);
+    const startedAt = Date.now();
+    try {
+      const d = await api('GET', `/owners?folder=${encodeURIComponent(folder)}`);
+      Object.assign(owners, { folder, map: d.owners || {}, seen, fetchedAt: Date.now(), startedAt, ok: true });
+    } catch (e) {
+      Object.assign(owners, { folder, map: {}, seen, fetchedAt: Date.now(), startedAt, ok: false });
+    } finally {
+      owners.fetching = false;
+    }
+    markOwners();
+  }
+
+  function nameCell(tr, name) {
+    for (const td of tr.children) {
+      const t = td.firstChild;
+      if (t && t.nodeType === Node.TEXT_NODE && t.data.trim() === name) return td;
+    }
+    return null;
+  }
+
+  function markOwners() {
+    const rows = [];
+    for (const tr of document.querySelectorAll('tr.file-list-cursor')) {
+      const vm = tr.__vue__;
+      if (!vm || !vm.item || typeof vm.item.filename !== 'string' || typeof vm.currentPath !== 'string') continue;
+      if (typeof vm.deleteFile !== 'function' && typeof vm.deleteDirectory !== 'function') continue;
+      rows.push({ tr, name: vm.item.filename, folder: 'gcodes' + vm.currentPath });
+    }
+    if (!rows.length) return;
+    const folder = rows[0].folder;
+    // what is already in the folder when it opens is old (0); what shows up later may be an upload in progress
+    const now = folder === owners.folder ? Date.now() : 0;
+    for (const r of rows) if (!firstSeen.has(`${r.folder}/${r.name}`)) firstSeen.set(`${r.folder}/${r.name}`, now);
+    const stale = Date.now() - owners.fetchedAt > 15000;
+    const newItem = rows.some(r => !owners.seen.has(r.name));  // a new file/folder appeared
+    if (folder !== owners.folder || stale || newItem) fetchOwners(folder, rows.map(r => r.name));
+    // the list may show up before the gateway records the owner: check again shortly after
+    if (newItem && folder === owners.folder) setTimeout(() => { owners.fetchedAt = 0; markOwners(); }, 2500);
+    if (folder !== owners.folder) return;
+    for (const { tr, name } of rows) {
+      const td = nameCell(tr, name);
+      if (!td) continue;
+      const owner = owners.map[name] || '';
+      let tag = td.querySelector('.rbac-owner');
+      // no owner: only mark it after a lookup made well after the item appeared (the gateway may
+      // still be recording a fresh upload) and only if the lookup succeeded
+      const noRecord = !owner && owners.ok && owners.startedAt - firstSeen.get(`${folder}/${name}`) >= 2000;
+      if (!owner && !noRecord) { if (tag) tag.remove(); continue; }
+      const key = owner || '-';
+      if (tag && tag.dataset.owner === key) continue;
+      if (!tag) { tag = document.createElement('span'); td.appendChild(tag); }
+      tag.dataset.owner = key;
+      if (noRecord) {
+        tag.className = 'rbac-owner rbac-owner--none';
+        tag.title = 'Created outside the gateway (SSH, direct copy...): no record of who created it. Only an admin can delete it.';
+        tag.innerHTML = `${svg(ICON_PERSON, 12)}no record`;
+        continue;
+      }
+      tag.className = 'rbac-owner' + (owner === myName ? ' rbac-owner--you' : '');
+      tag.title = `Created by ${owner}`;
+      tag.innerHTML = `${svg(ICON_PERSON, 12)}${esc(owner === myName ? `${owner} (you)` : owner)}`;
+    }
+  }
+
   // ------------------------------------------------------------------ start
   async function start() {
     let me;
     try { me = await api('GET', '/me'); } catch (e) { return; }
-    if (me.role !== 'admin') return;
+    myName = me.username;
+    const admin = me.role === 'admin';
     const style = document.createElement('style');
     style.textContent = CSS;
     document.head.appendChild(style);
+    const refresh = () => { if (admin) installTab(); markOwners(); };
     let scheduled = false;
     new MutationObserver(() => {
       if (scheduled) return;
       scheduled = true;
-      requestAnimationFrame(() => { scheduled = false; installTab(); });
+      requestAnimationFrame(() => { scheduled = false; refresh(); });
     }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
-    installTab();
+    setInterval(markOwners, 5000);
+    refresh();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
